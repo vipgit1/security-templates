@@ -11,6 +11,10 @@ on:
         description: "Run Snyk Code (SAST)"
         type: boolean
         default: true
+      gate-on-pr:
+        description: "Fail PR runs on any finding (not just new ones)"
+        type: boolean
+        default: false
     secrets:
       SNYK_TOKEN:
         required: true
@@ -35,14 +39,32 @@ jobs:
 
       - name: Snyk Open Source
         id: oss
-        run: snyk test --all-projects --severity-threshold=$SEVERITY --sarif-file-output=snyk-oss.sarif
-        continue-on-error: true
+        run: |
+          set +e
+          snyk test --all-projects --sarif-file-output=snyk-oss.sarif
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
 
       - name: Snyk Code
         id: code
         if: inputs.run-code-scan
-        run: snyk code test --severity-threshold=$SEVERITY --sarif-file-output=snyk-code.sarif
-        continue-on-error: true
+        run: |
+          set +e
+          snyk code test --sarif-file-output=snyk-code.sarif
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Snyk Open Source results
+        if: always() && hashFiles('snyk-oss.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-oss.sarif
+          category: snyk-open-source
+
+      - name: Upload Snyk Code results
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
 
       - name: Post PR summary
         if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -89,22 +111,25 @@ jobs:
                 ...context.repo, issue_number: context.issue.number, body,
               });
             }
-      - name: Upload Snyk Open Source results
-        if: always() && hashFiles('snyk-oss.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: snyk-oss.sarif
-          category: snyk-open-source
-
-      - name: Upload Snyk Code results
-        if: always() && hashFiles('snyk-code.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: snyk-code.sarif
-          category: snyk-code
 
       - name: Enforce security gate
-        if: steps.oss.outcome == 'failure' || steps.code.outcome == 'failure'
+        if: always() && (github.event_name != 'pull_request' || inputs.gate-on-pr)
         run: |
-          echo "::error::Snyk found issues at or above '$SEVERITY', or a scan could not complete."
-          exit 1
+          fail=0
+          for code in "${{ steps.oss.outputs.exit }}" "${{ steps.code.outputs.exit }}"; do
+            if [ -n "$code" ] && [ "$code" -gt 1 ]; then
+              echo "::error::A scan could not complete (exit code $code)"; fail=1
+            fi
+          done
+          case "$SEVERITY" in
+            critical|high) levels='"error"' ;;
+            medium)        levels='"error","warning"' ;;
+            *)             levels='"error","warning","note"' ;;
+          esac
+          for f in snyk-oss.sarif snyk-code.sarif; do
+            [ -f "$f" ] || continue
+            n=$(jq "[.runs[].results[]? | select(.level | IN($levels))] | length" "$f")
+            echo "$f: $n finding(s) at or above $SEVERITY"
+            [ "$n" -gt 0 ] && fail=1
+          done
+          exit $fail
