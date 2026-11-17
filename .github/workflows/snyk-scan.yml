@@ -54,8 +54,9 @@ jobs:
 
       - name: Snyk Monitor (dashboard snapshot)
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        run: snyk monitor --all-projects
+       run: snyk monitor --all-projects --target-reference=${{ github.ref_name }}
         continue-on-error: true
+        
       - name: Upload Snyk Open Source results
         if: always() && hashFiles('snyk-oss.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
