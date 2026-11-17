@@ -54,7 +54,7 @@ jobs:
 
       - name: Snyk Monitor (dashboard snapshot)
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-       run: snyk monitor --all-projects --target-reference=${{ github.ref_name }}
+        run: snyk monitor --all-projects
         continue-on-error: true
         
       - name: Upload Snyk Open Source results
