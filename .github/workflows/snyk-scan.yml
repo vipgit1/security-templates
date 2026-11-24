@@ -15,6 +15,10 @@ on:
         description: "Fail PR runs on any finding (not just new ones)"
         type: boolean
         default: false
+      enforce-gate:
+        description: "Fail the run when findings meet the severity threshold. Set false for report-only mode"
+        type: boolean
+        default: true
     secrets:
       SNYK_TOKEN:
         required: true
@@ -119,11 +123,15 @@ jobs:
 
       - name: Enforce security gate
         if: always() && (github.event_name != 'pull_request' || inputs.gate-on-pr)
+        env:
+          ENFORCE: ${{ inputs.enforce-gate }}
+          OSS_EXIT: ${{ steps.oss.outputs.exit }}
+          CODE_EXIT: ${{ steps.code.outputs.exit }}
         run: |
-          fail=0
-          for code in "${{ steps.oss.outputs.exit }}" "${{ steps.code.outputs.exit }}"; do
+          broken=0; found=0
+          for code in "$OSS_EXIT" "$CODE_EXIT"; do
             if [ -n "$code" ] && [ "$code" -gt 1 ]; then
-              echo "::error::A scan could not complete (exit code $code)"; fail=1
+              echo "::error::A scan could not complete (exit code $code)"; broken=1
             fi
           done
           case "$SEVERITY" in
@@ -135,6 +143,12 @@ jobs:
             [ -f "$f" ] || continue
             n=$(jq "[.runs[].results[]? | select(.level | IN($levels))] | length" "$f")
             echo "$f: $n finding(s) at or above $SEVERITY"
-            [ "$n" -gt 0 ] && fail=1
+            [ "$n" -gt 0 ] && found=1
           done
-          exit $fail
+          [ "$broken" -eq 1 ] && exit 1
+          if [ "$found" -eq 1 ]; then
+            if [ "$ENFORCE" = "true" ]; then exit 1; fi
+            echo "::warning::Findings at or above '$SEVERITY' exist. The gate is in report-only mode, so this run is not failed."
+          fi
+          exit 0
+     
