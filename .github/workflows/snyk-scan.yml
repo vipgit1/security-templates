@@ -11,6 +11,10 @@ on:
         description: "Run Snyk Code (SAST)"
         type: boolean
         default: true
+      run-secret-scan:
+        description: "Run Gitleaks (secrets)"
+        type: boolean
+        default: true
       gate-on-pr:
         description: "Fail PR runs on any finding (not just new ones)"
         type: boolean
@@ -56,11 +60,29 @@ jobs:
           snyk code test --sarif-file-output=snyk-code.sarif
           echo "exit=$?" >> "$GITHUB_OUTPUT"
 
+      - name: Gitleaks (secrets)
+        id: secrets
+        if: inputs.run-secret-scan
+        run: |
+          set +e
+          VERSION=8.30.0
+          SHA256=79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
+          ARCHIVE="$RUNNER_TEMP/gitleaks.tar.gz"
+          if curl -sSfL -o "$ARCHIVE" "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            && echo "${SHA256}  ${ARCHIVE}" | sha256sum -c - \
+            && tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP" gitleaks; then
+            "$RUNNER_TEMP/gitleaks" dir . --report-format sarif --report-path gitleaks.sarif --redact --exit-code 0 --no-banner
+            echo "exit=$?" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not download or verify Gitleaks"
+            echo "exit=2" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Snyk Monitor (dashboard snapshot)
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: snyk monitor --all-projects
         continue-on-error: true
-        
+
       - name: Upload Snyk Open Source results
         if: always() && hashFiles('snyk-oss.sarif') != ''
         uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26  # v4.39.2
@@ -75,33 +97,83 @@ jobs:
           sarif_file: snyk-code.sarif
           category: snyk-code
 
+      - name: Upload Gitleaks results
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26  # v4.39.2
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
       - name: Post PR summary
         if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          OSS_EXIT: ${{ steps.oss.outputs.exit }}
+          CODE_EXIT: ${{ steps.code.outputs.exit }}
+          SECRETS_EXIT: ${{ steps.secrets.outputs.exit }}
+          RUN_CODE: ${{ inputs.run-code-scan }}
+          RUN_SECRETS: ${{ inputs.run-secret-scan }}
         with:
           script: |
             const fs = require('fs');
-            const count = (file) => {
+            const sev = (l) => (l === 'error' ? 'high' : l === 'warning' ? 'medium' : 'low');
+            const load = (file) => {
               if (!fs.existsSync(file)) return null;
-              const results = JSON.parse(fs.readFileSync(file, 'utf8')).runs
-                .flatMap(r => r.results || []);
-              return {
-                high: results.filter(r => r.level === 'error').length,
-                medium: results.filter(r => r.level === 'warning').length,
-                low: results.filter(r => r.level === 'note').length,
-              };
+              try {
+                return JSON.parse(fs.readFileSync(file, 'utf8')).runs.flatMap((r) => r.results || []);
+              } catch (e) {
+                return null;
+              }
             };
-            const row = (name, c) => c
-              ? `| ${name} | ${c.high} | ${c.medium} | ${c.low} |`
-              : `| ${name} | n/a | n/a | n/a |`;
+            const tally = (results) =>
+              results.reduce((a, r) => { a[sev(r.level)]++; return a; }, { high: 0, medium: 0, low: 0 });
+
+            const changed = new Set(
+              (await github.paginate(github.rest.pulls.listFiles, {
+                ...context.repo, pull_number: context.issue.number, per_page: 100,
+              })).map((f) => f.filename)
+            );
+            const inChanged = (r) =>
+              (r.locations || []).some((l) => changed.has(((l.physicalLocation || {}).artifactLocation || {}).uri));
+
+            const scans = [
+              { name: 'Open Source (dependencies)', file: 'snyk-oss.sarif', exit: process.env.OSS_EXIT, enabled: true },
+              { name: 'Code (SAST)', file: 'snyk-code.sarif', exit: process.env.CODE_EXIT, enabled: process.env.RUN_CODE === 'true' },
+              { name: 'Secrets (Gitleaks)', file: 'gitleaks.sarif', exit: process.env.SECRETS_EXIT, enabled: process.env.RUN_SECRETS === 'true', strict: true, allHigh: true },
+            ];
+
+            let failed = false;
+            const rows = (pick) => scans.map((s) => {
+              if (!s.enabled) return `| ${s.name} | skipped | skipped | skipped |`;
+              const results = load(s.file);
+              const bad = s.strict ? Number(s.exit) !== 0 : Number(s.exit) > 1;
+              if (results === null || bad) {
+                failed = true;
+                return `| ${s.name} | ⚠️ not completed | ⚠️ not completed | ⚠️ not completed |`;
+              }
+              const picked = pick(results);
+              const t = s.allHigh ? { high: picked.length, medium: 0, low: 0 } : tally(picked);
+              return `| ${s.name} | ${t.high} | ${t.medium} | ${t.low} |`;
+            });
+
+            const head = ['| Scan | High/Critical | Medium | Low |', '|---|---|---|---|'];
+            const introduced = rows((r) => r.filter(inChanged));
+            const totals = rows((r) => r);
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
             const body = [
               '## Snyk security summary',
               '',
-              '| Scan | High/Critical | Medium | Low |',
-              '|---|---|---|---|',
-              row('Open Source (dependencies)', count('snyk-oss.sarif')),
-              row('Code (SAST)', count('snyk-code.sarif')),
+              `### Found in the ${changed.size} file(s) changed by this PR`,
+              '',
+              ...head, ...introduced,
+              '',
+              '### Repository totals (all existing findings)',
+              '',
+              ...head, ...totals,
+              '',
+              ...(failed ? ['> ⚠️ **A scan did not complete.** These numbers are not reliable. Check the workflow run log.', ''] : []),
+              'Every secret found is counted as high severity.',
               '',
               `Details: [workflow run](${runUrl}) and the **Security → Code scanning** tab.`,
               '<!-- snyk-summary -->',
@@ -110,15 +182,11 @@ jobs:
             const { data: comments } = await github.rest.issues.listComments({
               ...context.repo, issue_number: context.issue.number,
             });
-            const existing = comments.find(c => c.body.includes('<!-- snyk-summary -->'));
+            const existing = comments.find((c) => c.body.includes('<!-- snyk-summary -->'));
             if (existing) {
-              await github.rest.issues.updateComment({
-                ...context.repo, comment_id: existing.id, body,
-              });
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
             } else {
-              await github.rest.issues.createComment({
-                ...context.repo, issue_number: context.issue.number, body,
-              });
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
             }
 
       - name: Enforce security gate
@@ -127,6 +195,8 @@ jobs:
           ENFORCE: ${{ inputs.enforce-gate }}
           OSS_EXIT: ${{ steps.oss.outputs.exit }}
           CODE_EXIT: ${{ steps.code.outputs.exit }}
+          SECRETS_EXIT: ${{ steps.secrets.outputs.exit }}
+          RUN_SECRETS: ${{ inputs.run-secret-scan }}
         run: |
           broken=0; found=0
           for code in "$OSS_EXIT" "$CODE_EXIT"; do
@@ -145,10 +215,18 @@ jobs:
             echo "$f: $n finding(s) at or above $SEVERITY"
             [ "$n" -gt 0 ] && found=1
           done
+          if [ "$RUN_SECRETS" = "true" ]; then
+            if [ "$SECRETS_EXIT" != "0" ] || [ ! -f gitleaks.sarif ]; then
+              echo "::error::The secrets scan could not complete (exit code ${SECRETS_EXIT:-unknown})"; broken=1
+            else
+              s=$(jq '[.runs[].results[]?] | length' gitleaks.sarif)
+              echo "gitleaks.sarif: $s secret(s) found"
+              [ "$s" -gt 0 ] && found=1
+            fi
+          fi
           [ "$broken" -eq 1 ] && exit 1
           if [ "$found" -eq 1 ]; then
             if [ "$ENFORCE" = "true" ]; then exit 1; fi
-            echo "::warning::Findings at or above '$SEVERITY' exist. The gate is in report-only mode, so this run is not failed."
+            echo "::warning::Findings exist. The gate is in report-only mode, so this run is not failed."
           fi
           exit 0
-     
